@@ -1,6 +1,7 @@
 package gost
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,7 @@ type Manager struct {
 type process struct {
 	cmd        *exec.Cmd
 	configPath string
+	configData []byte
 	done       chan error
 	exited     bool
 	exitErr    error
@@ -52,6 +54,11 @@ func NewManager(cfg ManagerConfig, logger *slog.Logger) *Manager {
 }
 
 func (m *Manager) Reload(ctx context.Context, cfg Config) error {
+	data, err := marshalConfig(cfg)
+	if err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	current := m.current
 	if current != nil && current.exited {
@@ -61,16 +68,24 @@ func (m *Manager) Reload(ctx context.Context, cfg Config) error {
 	m.mu.Unlock()
 
 	if current != nil {
-		if err := m.writeConfigFile(current.configPath, cfg); err != nil {
+		if bytes.Equal(current.configData, data) {
+			return nil
+		}
+		if err := writeConfigData(current.configPath, data); err != nil {
 			return err
 		}
 		if err := reloadProcess(current); err != nil {
 			return err
 		}
+		m.mu.Lock()
+		if m.current == current {
+			current.configData = append(current.configData[:0], data...)
+		}
+		m.mu.Unlock()
 		return waitForServices(ctx, cfg.Services, 3*time.Second)
 	}
 
-	configPath, err := m.writeConfig(cfg)
+	configPath, err := m.writeConfigBytes(data)
 	if err != nil {
 		return err
 	}
@@ -79,6 +94,7 @@ func (m *Manager) Reload(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	proc.configData = append([]byte(nil), data...)
 	m.mu.Lock()
 	m.current = proc
 	m.mu.Unlock()
@@ -118,25 +134,21 @@ func (m *Manager) Status() Status {
 	return status
 }
 
-func (m *Manager) writeConfig(cfg Config) (string, error) {
+func marshalConfig(cfg Config) ([]byte, error) {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return "", fmt.Errorf("marshal gost config: %w", err)
+		return nil, fmt.Errorf("marshal gost config: %w", err)
 	}
+	return data, nil
+}
+
+func (m *Manager) writeConfigBytes(data []byte) (string, error) {
 	dir := m.cfg.ConfigDir
 	if dir == "" {
 		dir = filepath.Join(os.TempDir(), "proxy-runtime")
 	}
 	path := filepath.Join(dir, "gost.json")
 	return path, writeConfigData(path, data)
-}
-
-func (m *Manager) writeConfigFile(path string, cfg Config) error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal gost config: %w", err)
-	}
-	return writeConfigData(path, data)
 }
 
 func writeConfigData(path string, data []byte) error {

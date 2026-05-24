@@ -34,9 +34,11 @@ type Runtime struct {
 	dynamicListeners []config.EgressListener
 	refreshedAt      time.Time
 
+	refreshMu        sync.Mutex
 	forwardMu        sync.Mutex
 	forwardCancel    context.CancelFunc
 	forwardListeners []net.Listener
+	forwardSignature string
 }
 
 func NewRuntime(cfg config.Config, proxyProvider provider.Provider, manager *gost.Manager, logger *slog.Logger) *Runtime {
@@ -89,6 +91,9 @@ func (r *Runtime) refreshLoop(ctx context.Context, errCh chan<- error) {
 }
 
 func (r *Runtime) refresh(ctx context.Context) error {
+	r.refreshMu.Lock()
+	defer r.refreshMu.Unlock()
+
 	session := r.currentSession()
 	nodes, err := r.provider.Fetch(ctx, session)
 	if err != nil {
@@ -562,10 +567,20 @@ func (r *Runtime) gostListeners() []gost.LocalService {
 }
 
 func (r *Runtime) reloadForwarders(_ context.Context) error {
-	r.stopForwarders()
-
 	listeners := r.upstreamListenerConfigs()
+	signature := upstreamForwarderSignature(listeners)
+	r.forwardMu.Lock()
+	if r.forwardSignature == signature {
+		r.forwardMu.Unlock()
+		return nil
+	}
+	r.forwardMu.Unlock()
+
+	r.stopForwarders()
 	if len(listeners) == 0 {
+		r.forwardMu.Lock()
+		r.forwardSignature = signature
+		r.forwardMu.Unlock()
 		return nil
 	}
 	forwardCtx, cancel := context.WithCancel(context.Background())
@@ -590,6 +605,7 @@ func (r *Runtime) reloadForwarders(_ context.Context) error {
 	r.forwardMu.Lock()
 	r.forwardCancel = cancel
 	r.forwardListeners = started
+	r.forwardSignature = signature
 	r.forwardMu.Unlock()
 	return nil
 }
@@ -600,6 +616,7 @@ func (r *Runtime) stopForwarders() {
 	listeners := r.forwardListeners
 	r.forwardCancel = nil
 	r.forwardListeners = nil
+	r.forwardSignature = ""
 	r.forwardMu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -611,6 +628,26 @@ func closeListeners(listeners []net.Listener) {
 	for _, ln := range listeners {
 		_ = ln.Close()
 	}
+}
+
+func upstreamForwarderSignature(listeners []config.EgressListener) string {
+	if len(listeners) == 0 {
+		return "[]"
+	}
+	var b strings.Builder
+	for _, listener := range listeners {
+		b.WriteString(listener.ID)
+		b.WriteByte('\x00')
+		b.WriteString(listener.Addr)
+		b.WriteByte('\x00')
+		b.WriteString(listener.Upstream)
+		b.WriteByte('\x00')
+		b.WriteString(listener.Protocol)
+		b.WriteByte('\x00')
+		b.WriteString(listener.Route)
+		b.WriteByte('\x00')
+	}
+	return b.String()
 }
 
 func (r *Runtime) serveForwarder(ctx context.Context, listenerID string, ln net.Listener, upstreamAddr string) {

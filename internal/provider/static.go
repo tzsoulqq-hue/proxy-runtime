@@ -2,10 +2,14 @@ package provider
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/url"
+	"time"
 
 	proxyruntimev1 "github.com/byte-v-forge/proxy-runtime/gen/byte/v/forge/contracts/proxyruntime/v1"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type Static struct {
@@ -71,7 +75,28 @@ func (s *Static) Fetch(context.Context, *proxyruntimev1.ProxySession) ([]Node, e
 }
 
 func (s *Static) CreateSession(context.Context, *proxyruntimev1.CreateProxySessionRequest) (*proxyruntimev1.ProxySession, error) {
-	return nil, ErrUnsupportedCapability
+	raw := make([]byte, 8)
+	if _, err := rand.Read(raw); err != nil {
+		return nil, fmt.Errorf("generate static proxy session id: %w", err)
+	}
+	now := time.Now().UTC()
+	expiresAt := now.Add(30 * time.Minute)
+	return &proxyruntimev1.ProxySession{
+		SessionId: hex.EncodeToString(raw),
+		Provider:  proxyruntimev1.ProxyProvider_PROXY_PROVIDER_STATIC,
+		Policy: &proxyruntimev1.ProxySessionPolicy{
+			Mode:             proxyruntimev1.ProxySessionMode_PROXY_SESSION_MODE_STICKY,
+			UpstreamKind:     proxyruntimev1.ProxyUpstreamKind_PROXY_UPSTREAM_KIND_SIMPLE_PROXY,
+			RotationMode:     proxyruntimev1.ProxyRotationMode_PROXY_ROTATION_MODE_NONE,
+			StickyTtlMinutes: 30,
+		},
+		CreatedAt: timestamppb.New(now),
+		ExpiresAt: timestamppb.New(expiresAt),
+		Labels: map[string]string{
+			"provider":     s.Name(),
+			"session_mode": "static_compat",
+		},
+	}, nil
 }
 
 func StaticChainEndpoints(rawProxies []string) ([]*proxyruntimev1.ProxyEndpoint, error) {

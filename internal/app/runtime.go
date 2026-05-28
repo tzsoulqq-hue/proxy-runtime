@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +32,8 @@ type Runtime struct {
 	mu               sync.RWMutex
 	pool             []provider.Node
 	activeSession    *proxyruntimev1.ProxySession
+	listenerPools    map[string][]provider.Node
+	activeSessions   map[string]*proxyruntimev1.ProxySession
 	dynamicListeners []config.EgressListener
 	refreshedAt      time.Time
 
@@ -46,10 +49,12 @@ func NewRuntime(cfg config.Config, proxyProvider provider.Provider, manager *gos
 		logger = slog.Default()
 	}
 	return &Runtime{
-		cfg:      cfg,
-		provider: proxyProvider,
-		manager:  manager,
-		logger:   logger,
+		cfg:            cfg,
+		provider:       proxyProvider,
+		manager:        manager,
+		logger:         logger,
+		listenerPools:  map[string][]provider.Node{},
+		activeSessions: map[string]*proxyruntimev1.ProxySession{},
 	}
 }
 
@@ -94,11 +99,11 @@ func (r *Runtime) refresh(ctx context.Context) error {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
 
-	session := r.currentSession()
-	nodes, err := r.provider.Fetch(ctx, session)
+	pools, sessions, err := r.fetchProviderPools(ctx)
 	if err != nil {
 		return err
 	}
+	nodes := pools[""]
 	staticChain, err := r.parseStaticChain()
 	if err != nil {
 		return err
@@ -106,7 +111,7 @@ func (r *Runtime) refresh(ctx context.Context) error {
 	if len(nodes) == 0 && len(staticChain) == 0 && r.cfg.Provider != config.ProviderNone {
 		return errors.New("proxy pool is empty")
 	}
-	gostConfig, err := r.buildGostConfig(staticChain, nodes)
+	gostConfig, err := r.buildGostConfig(staticChain, nodes, pools)
 	if err != nil {
 		return err
 	}
@@ -119,6 +124,12 @@ func (r *Runtime) refresh(ctx context.Context) error {
 
 	r.mu.Lock()
 	r.pool = append([]provider.Node(nil), nodes...)
+	r.listenerPools = cloneListenerPools(pools)
+	for listenerID, session := range sessions {
+		if session != nil {
+			r.activeSessions[listenerID] = session
+		}
+	}
 	r.refreshedAt = time.Now().UTC()
 	r.mu.Unlock()
 
@@ -126,10 +137,47 @@ func (r *Runtime) refresh(ctx context.Context) error {
 	return nil
 }
 
-func (r *Runtime) buildGostConfig(staticChain []*url.URL, nodes []provider.Node) (gost.Config, error) {
+func (r *Runtime) fetchProviderPools(ctx context.Context) (map[string][]provider.Node, map[string]*proxyruntimev1.ProxySession, error) {
+	pools := map[string][]provider.Node{}
+	sessions := map[string]*proxyruntimev1.ProxySession{}
+	listenerIDs := r.providerListenerIDs()
+	if len(listenerIDs) == 0 {
+		session := r.currentSession()
+		nodes, err := r.provider.Fetch(ctx, session)
+		if err != nil {
+			return nil, nil, err
+		}
+		pools[""] = nodes
+		sessions[""] = session
+		return pools, sessions, nil
+	}
+	for _, listenerID := range listenerIDs {
+		session := r.currentSessionForListener(listenerID)
+		nodes, err := r.provider.Fetch(ctx, session)
+		if err != nil {
+			return nil, nil, err
+		}
+		pools[listenerID] = nodes
+		pools[""] = append(pools[""], nodes...)
+		if session != nil {
+			sessions[listenerID] = session
+		}
+	}
+	return pools, sessions, nil
+}
+
+func cloneListenerPools(in map[string][]provider.Node) map[string][]provider.Node {
+	out := make(map[string][]provider.Node, len(in))
+	for key, nodes := range in {
+		out[key] = append([]provider.Node(nil), nodes...)
+	}
+	return out
+}
+
+func (r *Runtime) buildGostConfig(staticChain []*url.URL, nodes []provider.Node, pools map[string][]provider.Node) (gost.Config, error) {
 	if r.usesListenerCatalog() {
 		return gost.BuildEgressConfig(gost.EgressConfig{
-			Listeners:   r.gostListeners(),
+			Listeners:   r.gostListeners(pools),
 			StaticChain: staticChain,
 			Pool:        nodes,
 		})
@@ -285,33 +333,87 @@ func (r *Runtime) handleNewSession(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	var createReq proxyruntimev1.CreateProxySessionRequest
+	listenerID := strings.TrimSpace(req.URL.Query().Get("listener_id"))
 	if req.Body != nil && req.ContentLength != 0 {
 		body, err := readRequestBody(req)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		listenerID = firstNonEmptyString(listenerID, listenerIDFromCreateSessionJSON(body))
 		if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &createReq); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 	}
-	session, err := r.provider.CreateSession(req.Context(), &createReq)
+	listenerID = firstNonEmptyString(listenerID, listenerIDFromCreateSessionRequest(&createReq))
+	session, err := r.createCheckedSession(req.Context(), &createReq, listenerID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	r.mu.Lock()
-	r.activeSession = session
-	r.mu.Unlock()
-	if err := r.refresh(req.Context()); err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	r.writeProto(w, &proxyruntimev1.CreateProxySessionResponse{
 		Session: session,
 		Pool:    r.snapshot(),
 	})
+}
+
+func (r *Runtime) createCheckedSession(ctx context.Context, createReq *proxyruntimev1.CreateProxySessionRequest, listenerID string) (*proxyruntimev1.ProxySession, error) {
+	listenerID = strings.TrimSpace(listenerID)
+	if listenerID != "" && !r.providerListenerIDExists(listenerID) {
+		return nil, fmt.Errorf("provider listener %q not found", listenerID)
+	}
+	attempts := 1
+	if r.cfg.IPRiskCheck.Enabled {
+		attempts = r.cfg.IPRiskCheck.MaxAttempts
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		session, err := r.provider.CreateSession(ctx, createReq)
+		if err != nil {
+			return nil, err
+		}
+		if session.Labels == nil {
+			session.Labels = map[string]string{}
+		}
+		session.Labels["risk_check_attempt"] = fmt.Sprintf("%d", attempt)
+		if listenerID != "" {
+			session.Labels["listener_id"] = listenerID
+		}
+
+		r.mu.Lock()
+		if listenerID == "" {
+			r.activeSession = session
+		} else {
+			r.activeSessions[listenerID] = session
+		}
+		r.mu.Unlock()
+		if err := r.refresh(ctx); err != nil {
+			return nil, err
+		}
+		if !r.cfg.IPRiskCheck.Enabled {
+			return session, nil
+		}
+		result, err := r.checkActiveSessionRisk(ctx, listenerID)
+		if err != nil {
+			lastErr = err
+			session.Labels["risk_check_status"] = "error"
+			session.Labels["risk_check_error"] = snippet(err.Error(), 180)
+			r.logger.Warn("proxy session risk check failed", "attempt", attempt, "error", err)
+			continue
+		}
+		result.applyToSession(session)
+		if result.Accepted {
+			r.logger.Info("proxy session risk check accepted", "attempt", attempt, "ip", result.IP, "trust_score", result.TrustScore)
+			return session, nil
+		}
+		lastErr = fmt.Errorf("IP risk rejected ip=%s trust_score=%d min=%d", result.IP, result.TrustScore, r.cfg.IPRiskCheck.MinTrustScore)
+		r.logger.Warn("proxy session risk check rejected", "attempt", attempt, "ip", result.IP, "trust_score", result.TrustScore, "min", r.cfg.IPRiskCheck.MinTrustScore)
+	}
+	if lastErr == nil {
+		lastErr = errors.New("proxy session risk check failed")
+	}
+	return nil, fmt.Errorf("no acceptable proxy session after %d attempts: %w", attempts, lastErr)
 }
 
 func (r *Runtime) handleListeners(w http.ResponseWriter, req *http.Request) {
@@ -406,6 +508,14 @@ func (r *Runtime) snapshot() *proxyruntimev1.ProxyPoolSnapshot {
 	r.mu.RLock()
 	nodes := append([]provider.Node(nil), r.pool...)
 	session := r.activeSession
+	if session == nil {
+		for _, candidate := range r.activeSessions {
+			if candidate != nil {
+				session = candidate
+				break
+			}
+		}
+	}
 	refreshedAt := r.refreshedAt
 	r.mu.RUnlock()
 
@@ -546,24 +656,59 @@ func (r *Runtime) defaultListenerConfigs() []config.EgressListener {
 	return listeners
 }
 
-func (r *Runtime) gostListeners() []gost.LocalService {
+func (r *Runtime) gostListeners(pools map[string][]provider.Node) []gost.LocalService {
 	configs := r.listenerConfigs()
+	listenerPools := cloneListenerPools(pools)
+	if len(listenerPools) == 0 {
+		r.mu.RLock()
+		listenerPools = cloneListenerPools(r.listenerPools)
+		r.mu.RUnlock()
+	}
 	services := make([]gost.LocalService, 0, len(configs))
 	for _, listener := range configs {
 		if listenerRoute(listener) == config.ListenerRouteUpstream {
 			continue
 		}
 		services = append(services, gost.LocalService{
-			Name:     listener.ID,
-			Addr:     listener.Addr,
-			Protocol: listenerProtocol(listener, r.cfg.LocalProtocol),
-			Username: listener.Username,
-			Password: listener.Password,
-			Route:    listenerRoute(listener),
-			Upstream: listener.Upstream,
+			Name:            listener.ID,
+			Addr:            listener.Addr,
+			Protocol:        listenerProtocol(listener, r.cfg.LocalProtocol),
+			Username:        listener.Username,
+			Password:        listener.Password,
+			Route:           listenerRoute(listener),
+			Upstream:        listener.Upstream,
+			ProviderTargets: r.cfg.ProviderTargets,
+			ProviderNodes:   listenerPools[listener.ID],
 		})
 	}
 	return services
+}
+
+func (r *Runtime) providerListenerIDs() []string {
+	configs := r.listenerConfigs()
+	if len(configs) == 0 {
+		configs = r.defaultListenerConfigs()
+	}
+	ids := make([]string, 0, len(configs))
+	for _, listener := range configs {
+		if listenerRoute(listener) == config.ListenerRouteProvider {
+			ids = append(ids, listener.ID)
+		}
+	}
+	return ids
+}
+
+func (r *Runtime) providerListenerIDExists(listenerID string) bool {
+	listenerID = strings.TrimSpace(listenerID)
+	if listenerID == "" {
+		return true
+	}
+	for _, id := range r.providerListenerIDs() {
+		if id == listenerID {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Runtime) reloadForwarders(_ context.Context) error {
@@ -846,6 +991,81 @@ func (r *Runtime) currentSession() *proxyruntimev1.ProxySession {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.activeSession
+}
+
+func (r *Runtime) currentSessionForListener(listenerID string) *proxyruntimev1.ProxySession {
+	listenerID = strings.TrimSpace(listenerID)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if listenerID != "" {
+		if session := r.activeSessions[listenerID]; session != nil {
+			return session
+		}
+	}
+	return r.activeSession
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func listenerIDFromCreateSessionRequest(req *proxyruntimev1.CreateProxySessionRequest) string {
+	if req == nil {
+		return ""
+	}
+	if value := strings.TrimSpace(req.GetProviderId()); value != "" && !strings.Contains(value, "://") {
+		return value
+	}
+	if req.GetPolicy() == nil {
+		return ""
+	}
+	return firstNonEmptyString(
+		req.GetPolicy().GetLabels()["listener_id"],
+		req.GetPolicy().GetLabels()["proxy_listener_id"],
+		req.GetPolicy().GetLabels()["egress_listener_id"],
+	)
+}
+
+func listenerIDFromCreateSessionJSON(body []byte) string {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return ""
+	}
+	if value := stringMapValue(raw, "listener_id"); value != "" {
+		return value
+	}
+	if value := stringMapValue(raw, "proxy_listener_id"); value != "" {
+		return value
+	}
+	policy, _ := raw["policy"].(map[string]any)
+	if len(policy) == 0 {
+		return ""
+	}
+	if value := stringMapValue(policy, "listener_id"); value != "" {
+		return value
+	}
+	labels, _ := policy["labels"].(map[string]any)
+	return firstNonEmptyString(
+		stringMapValue(labels, "listener_id"),
+		stringMapValue(labels, "proxy_listener_id"),
+		stringMapValue(labels, "egress_listener_id"),
+	)
+}
+
+func stringMapValue(values map[string]any, key string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	value, ok := values[key]
+	if !ok || value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
 }
 
 func (r *Runtime) writeProto(w http.ResponseWriter, message proto.Message) {

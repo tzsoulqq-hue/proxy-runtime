@@ -13,6 +13,7 @@ import (
 type Config struct {
 	Services []Service `json:"services"`
 	Chains   []Chain   `json:"chains,omitempty"`
+	Bypasses []Bypass  `json:"bypasses,omitempty"`
 }
 
 type Service struct {
@@ -38,8 +39,9 @@ type Chain struct {
 }
 
 type Hop struct {
-	Name  string `json:"name"`
-	Nodes []Node `json:"nodes"`
+	Name   string `json:"name"`
+	Nodes  []Node `json:"nodes"`
+	Bypass string `json:"bypass,omitempty"`
 }
 
 type Node struct {
@@ -63,14 +65,23 @@ type Auth struct {
 	Password string `json:"password"`
 }
 
+type Bypass struct {
+	Name      string   `json:"name"`
+	Matchers  []string `json:"matchers"`
+	Whitelist bool     `json:"whitelist,omitempty"`
+	Reverse   bool     `json:"reverse,omitempty"`
+}
+
 type LocalService struct {
-	Name     string
-	Addr     string
-	Protocol string
-	Username string
-	Password string
-	Route    string
-	Upstream string
+	Name            string
+	Addr            string
+	Protocol        string
+	Username        string
+	Password        string
+	Route           string
+	Upstream        string
+	ProviderTargets []string
+	ProviderNodes   []provider.Node
 }
 
 func BuildConfig(local LocalService, staticChain []*url.URL, pool []provider.Node) (Config, error) {
@@ -128,7 +139,50 @@ func BuildEgressConfig(opts EgressConfig) (Config, error) {
 }
 
 func buildListenerConfig(listeners []LocalService, staticChain []*url.URL, pool []provider.Node) (Config, error) {
-	chain, err := buildChain(staticChain, pool)
+	cfg := Config{}
+	for _, listener := range listeners {
+		serviceChain := ""
+		switch normalizeListenerRoute(listener.Route) {
+		case "provider":
+			listenerPool := pool
+			if listener.ProviderNodes != nil {
+				listenerPool = listener.ProviderNodes
+			}
+			chain, err := buildNamedChain(safeChainName(listener.Name), staticChain, listenerPool, listener.ProviderTargets)
+			if err != nil {
+				return Config{}, err
+			}
+			if len(chain.Hops) > 0 {
+				serviceChain = chain.Name
+				cfg.Chains = append(cfg.Chains, chain)
+				if len(listener.ProviderTargets) > 0 {
+					cfg.Bypasses = append(cfg.Bypasses, providerTargetBypass(listener.Name, listener.ProviderTargets))
+				}
+			}
+		case "direct":
+			serviceChain = ""
+		case "upstream":
+			upstreamChain, err := buildUpstreamChain(listener)
+			if err != nil {
+				return Config{}, err
+			}
+			serviceChain = upstreamChain.Name
+			cfg.Chains = append(cfg.Chains, upstreamChain)
+		}
+		cfg.Services = append(cfg.Services, buildService(listener, "proxy-runtime", serviceChain))
+	}
+	return cfg, nil
+}
+
+func buildListenerConfigOld(listeners []LocalService, staticChain []*url.URL, pool []provider.Node) (Config, error) {
+	var providerTargets []string
+	for _, listener := range listeners {
+		if normalizeListenerRoute(listener.Route) == "provider" && len(listener.ProviderTargets) > 0 {
+			providerTargets = listener.ProviderTargets
+			break
+		}
+	}
+	chain, err := buildChainWithProviderTargets(staticChain, pool, providerTargets)
 	if err != nil {
 		return Config{}, err
 	}
@@ -137,6 +191,9 @@ func buildListenerConfig(listeners []LocalService, staticChain []*url.URL, pool 
 	if len(chain.Hops) > 0 {
 		chainName = chain.Name
 		cfg.Chains = []Chain{chain}
+		if len(providerTargets) > 0 {
+			cfg.Bypasses = []Bypass{providerTargetBypass("", providerTargets)}
+		}
 	}
 	for _, listener := range listeners {
 		serviceChain := ""
@@ -177,7 +234,18 @@ func buildService(local LocalService, fallbackName string, chainName string) Ser
 }
 
 func buildChain(staticChain []*url.URL, pool []provider.Node) (Chain, error) {
-	chain := Chain{Name: "default-chain"}
+	return buildChainWithProviderTargets(staticChain, pool, nil)
+}
+
+func buildChainWithProviderTargets(staticChain []*url.URL, pool []provider.Node, providerTargets []string) (Chain, error) {
+	return buildNamedChain("default-chain", staticChain, pool, providerTargets)
+}
+
+func buildNamedChain(name string, staticChain []*url.URL, pool []provider.Node, providerTargets []string) (Chain, error) {
+	chain := Chain{Name: strings.TrimSpace(name)}
+	if chain.Name == "" {
+		chain.Name = "default-chain"
+	}
 	for index, upstream := range staticChain {
 		node, err := nodeFromURL(fmt.Sprintf("static-%d", index), upstream)
 		if err != nil {
@@ -197,9 +265,32 @@ func buildChain(staticChain []*url.URL, pool []provider.Node) (Chain, error) {
 			}
 			nodes = append(nodes, node)
 		}
-		chain.Hops = append(chain.Hops, Hop{Name: "provider-pool", Nodes: nodes})
+		hop := Hop{Name: "provider-pool", Nodes: nodes}
+		if len(providerTargets) > 0 {
+			hop.Bypass = providerTargetBypassName(chain.Name)
+		}
+		chain.Hops = append(chain.Hops, hop)
 	}
 	return chain, nil
+}
+
+func providerTargetBypass(listenerName string, targets []string) Bypass {
+	matchers := make([]string, 0, len(targets))
+	for _, target := range targets {
+		target = strings.TrimSpace(target)
+		if target != "" {
+			matchers = append(matchers, target)
+		}
+	}
+	return Bypass{Name: providerTargetBypassName(safeChainName(listenerName)), Matchers: matchers, Whitelist: true, Reverse: true}
+}
+
+func providerTargetBypassName(chainName string) string {
+	name := strings.TrimSuffix(strings.TrimSpace(chainName), "-chain")
+	if name == "" || name == "default" {
+		return "provider-targets"
+	}
+	return name + "-provider-targets"
 }
 
 func buildUpstreamChain(listener LocalService) (Chain, error) {

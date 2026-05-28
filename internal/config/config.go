@@ -43,6 +43,7 @@ type Config struct {
 	GostConfigDir     string
 	GostAPIAddr       string
 	GostMetricsAddr   string
+	ProviderTargets   []string
 	CommonEgressAddr  string
 	LocalAddr         string
 	LocalProtocol     string
@@ -55,7 +56,17 @@ type Config struct {
 	Listeners         []EgressListener
 	RefreshInterval   time.Duration
 	RequestTimeout    time.Duration
+	IPRiskCheck       IPRiskCheck
 	Ten24             ten24.Config
+}
+
+type IPRiskCheck struct {
+	Enabled       bool
+	URL           string
+	DiscoverURLs  []string
+	MaxAttempts   int
+	Timeout       time.Duration
+	MinTrustScore int
 }
 
 func LoadFromEnv() (Config, error) {
@@ -65,6 +76,7 @@ func LoadFromEnv() (Config, error) {
 		GostConfigDir:     strings.TrimSpace(os.Getenv("PROXY_RUNTIME_GOST_CONFIG_DIR")),
 		GostAPIAddr:       strings.TrimSpace(os.Getenv("PROXY_RUNTIME_GOST_API_ADDR")),
 		GostMetricsAddr:   strings.TrimSpace(os.Getenv("PROXY_RUNTIME_GOST_METRICS_ADDR")),
+		ProviderTargets:   envList("PROXY_RUNTIME_PROVIDER_TARGETS"),
 		CommonEgressAddr:  strings.TrimSpace(os.Getenv("PROXY_RUNTIME_COMMON_EGRESS_ADDR")),
 		LocalAddr:         envDefault("PROXY_RUNTIME_DYNAMIC_EGRESS_ADDR", envDefault("PROXY_RUNTIME_LOCAL_ADDR", ":1080")),
 		LocalProtocol:     envDefault("PROXY_RUNTIME_LOCAL_PROTOCOL", "http"),
@@ -77,6 +89,14 @@ func LoadFromEnv() (Config, error) {
 		Listeners:         envListeners("PROXY_RUNTIME_LISTENERS_JSON"),
 		RefreshInterval:   envDurationSeconds("PROXY_RUNTIME_REFRESH_SECONDS", 300*time.Second),
 		RequestTimeout:    envDurationSeconds("PROXY_RUNTIME_REQUEST_TIMEOUT_SECONDS", 10*time.Second),
+		IPRiskCheck: IPRiskCheck{
+			Enabled:       envBool("PROXY_RUNTIME_IP_RISK_CHECK_ENABLED", false),
+			URL:           envDefault("PROXY_RUNTIME_IP_RISK_CHECK_URL", "https://ip.net.coffee/api/ip/lookup/{ip}"),
+			DiscoverURLs:  envListDefault("PROXY_RUNTIME_IP_RISK_DISCOVER_URLS", []string{"https://ipinfo.io/ip", "https://api.ipify.org", "https://ifconfig.me/ip"}),
+			MaxAttempts:   envIntDefault("PROXY_RUNTIME_IP_RISK_MAX_ATTEMPTS", 3),
+			Timeout:       envDurationSeconds("PROXY_RUNTIME_IP_RISK_TIMEOUT_SECONDS", 20*time.Second),
+			MinTrustScore: envIntDefault("PROXY_RUNTIME_IP_RISK_MIN_TRUST_SCORE", 45),
+		},
 		Ten24: ten24.Config{
 			APIURL:        strings.TrimSpace(os.Getenv("PROXY_RUNTIME_1024_API_URL")),
 			APIRegion:     strings.TrimSpace(os.Getenv("PROXY_RUNTIME_1024_API_REGION")),
@@ -128,6 +148,23 @@ func (c Config) validate() error {
 	}
 	if c.RequestTimeout <= 0 {
 		return errors.New("PROXY_RUNTIME_REQUEST_TIMEOUT_SECONDS must be > 0")
+	}
+	if c.IPRiskCheck.Enabled {
+		if strings.TrimSpace(c.IPRiskCheck.URL) == "" {
+			return errors.New("PROXY_RUNTIME_IP_RISK_CHECK_URL is required when risk check is enabled")
+		}
+		if c.IPRiskCheck.MaxAttempts <= 0 {
+			return errors.New("PROXY_RUNTIME_IP_RISK_MAX_ATTEMPTS must be > 0")
+		}
+		if c.IPRiskCheck.Timeout <= 0 {
+			return errors.New("PROXY_RUNTIME_IP_RISK_TIMEOUT_SECONDS must be > 0")
+		}
+		if len(c.IPRiskCheck.DiscoverURLs) == 0 {
+			return errors.New("PROXY_RUNTIME_IP_RISK_DISCOVER_URLS is required when risk check is enabled")
+		}
+		if c.IPRiskCheck.MinTrustScore < 0 || c.IPRiskCheck.MinTrustScore > 100 {
+			return errors.New("PROXY_RUNTIME_IP_RISK_MIN_TRUST_SCORE must be between 0 and 100")
+		}
 	}
 	return nil
 }
@@ -183,6 +220,21 @@ func envDefault(name string, fallback string) string {
 	return value
 }
 
+func envBool(name string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	if value == "" {
+		return fallback
+	}
+	switch value {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
 func envList(name string) []string {
 	raw := strings.TrimSpace(os.Getenv(name))
 	if raw == "" {
@@ -195,6 +247,14 @@ func envList(name string) []string {
 		if value != "" {
 			values = append(values, value)
 		}
+	}
+	return values
+}
+
+func envListDefault(name string, fallback []string) []string {
+	values := envList(name)
+	if len(values) == 0 {
+		return append([]string{}, fallback...)
 	}
 	return values
 }
@@ -244,6 +304,18 @@ func envInt(name string) int {
 	parsed, err := strconv.Atoi(value)
 	if err != nil {
 		return 0
+	}
+	return parsed
+}
+
+func envIntDefault(name string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
 	}
 	return parsed
 }
